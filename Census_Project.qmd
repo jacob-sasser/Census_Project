@@ -1,0 +1,447 @@
+---
+title: "Census Project"
+format: html
+editor: visual
+---
+
+```{r}
+#| echo: false
+#libraries
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tibble)
+library(lubridate)
+library(hms)
+library(ggplot2)
+
+API_KEY_PATH = "API_KEY.txt"
+
+api_key_param = function(path = API_KEY_PATH) {
+  if (!file.exists(path)) {
+    return("")
+  }
+  key = trimws(readLines(path, n = 1, warn = FALSE))
+  if (length(key) == 0 || key == "") "" else paste0("&key=", key)
+}
+
+LEVELS_RDS_PATH = "data/pums_variable_levels.rds"
+```
+
+```{r}
+#Gather data
+valid_years=2021:2024
+wanted_variables=c("AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP", "PWGTP",
+            "FER", "HHL", "SCH", "SCHL", "SEX", "ST", "STATE",
+            "REGION", "DIVISION")
+
+
+dictionary_url = function(year) {
+  paste0("https://api.census.gov/data/", year, "/acs/acs1/pums/variables.json")
+}
+
+get_variables=function(year){
+  response=GET(dictionary_url(year))
+  stop_for_status(response)
+
+  parsed = fromJSON(rawToChar(response$content), simplifyVector = FALSE)
+  
+  all_vars=parsed$variables
+  
+  keep=intersect(wanted_variables,names(all_vars))
+  
+  lapply(all_vars[keep], function(var_info) {
+    items  = var_info$values$item
+    ranges = var_info$values$range
+    list(
+      label  = var_info$label,
+      values = if (is.null(items)) character(0) else unlist(items),
+      range  = if (is.null(ranges)) NULL else
+        do.call(rbind, lapply(ranges, as.data.frame))
+    )
+  })
+  }
+
+build_levels_rds = function(years = valid_years, path = LEVELS_RDS_PATH) {
+  levels_list = lapply(years, get_variables)
+  names(levels_list) = as.character(years)
+  
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+  saveRDS(levels_list, path)
+  invisible(levels_list)
+}
+
+
+
+load_year_levels = function(year, path = LEVELS_RDS_PATH) {
+  if (!file.exists(path)) {
+    stop("Could not find ", path, ". Run build_levels_rds() first.")
+  }
+  readRDS(path)[[as.character(year)]]
+}
+
+
+```
+
+```{r}
+if (!file.exists(LEVELS_RDS_PATH)) {
+  build_levels_rds()
+}
+
+variable_levels = readRDS(LEVELS_RDS_PATH)
+names(variable_levels)
+names(variable_levels[["2021"]])
+names(variable_levels[["2024"]])
+```
+
+Parsing API Data
+
+Example API Response
+
+```{r}
+example_url = paste0("https://api.census.gov/data/2024/acs/acs1/pums",
+                      "?get=SEX,PWGTP,MAR&for=state:37&SCHL=24",
+                      api_key_param())
+example_response = GET(example_url)
+example_parsed = fromJSON(rawToChar(example_response$content))
+head(example_parsed)
+```
+
+```{r}
+
+response_to_tibble=function(response){
+  stop_for_status(response)
+  parsed = fromJSON(rawToChar(response$content))
+  colnames(parsed) = parsed[1, ]
+  as_tibble(parsed[-1, , drop = FALSE])
+}
+
+response_to_tibble(example_response)
+
+```
+
+## Querying the API with a function
+
+Next we wrap the API call in a function that also cleans the data. The user can choose the year, the numeric and categorical variables, the geography level, and which state(s), division(s) or region(s) to subset on. First, the options the user is allowed to pick from:
+
+```{r}
+numeric_options = c("AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP")
+time_vars = c("JWAP", "JWDP")
+categorical_options = c("FER", "HHL", "SCH", "SCHL", "SEX")
+geography_options = c("region", "division", "state")
+
+# We are not working with Puerto Rico, so its codes are removed from the options
+puerto_rico_codes = list(state = "72", region = "9", division = "0")
+
+# Defaults when the user doesn't pick a specific place
+default_geo_value = list(state = "37",    # North Carolina
+                         region = "3",    # South
+                         division = "5")  # South Atlantic
+```
+
+### Matching API codes to the dictionary
+
+The dictionary doesn't write its codes consistently. For example, the `JWAP` codes include both `"0"` (N/A) and `"001"`, `"002"`, and so on, and `SCHL` mixes `"0"` with `"01"`, `"02"`. To make sure an API value finds its match no matter how either side pads it with zeros, these helpers drop leading zeros from numeric codes on both sides before looking anything up.
+
+```{r}
+normalize_codes = function(codes) {
+  codes = trimws(as.character(codes))
+  is_number = grepl("^[0-9]+$", codes)
+  codes[is_number] = as.character(as.integer(codes[is_number]))
+  codes
+}
+
+dictionary_lookup = function(values) {
+  names(values) = normalize_codes(names(values))
+  values[!duplicated(names(values))]
+}
+
+normalize_codes(c("001", "01", "0", "24"))
+```
+
+### Time variables
+
+`JWAP` (arrival time at work) and `JWDP` (departure time for work) are coded as time windows such as `"6:30 a.m. to 6:34 a.m."`. We want one time per person, so we take the midpoint of the window. The helpers below pull out the two clock times with a regular expression, parse them with `lubridate::parse_date_time()`, and average them. A window that crosses midnight needs its end time pushed forward a day before averaging. Anything that isn't a time window, like `"N/A (not a worker...)"`, becomes `NA`. The results are stored as `hms` times of day.
+
+```{r}
+# Convert clock strings like "6:30 a.m." to minutes after midnight
+clock_to_minutes = function(clock_strings) {
+  clock_strings = gsub("\\.", "", tolower(clock_strings))  # "6:30 am"
+  parsed = parse_date_time(clock_strings, orders = "I:M p", quiet = TRUE)
+  hour(parsed) * 60 + minute(parsed)
+}
+
+# Turn a time-window description into the midpoint of that window (hms)
+time_range_midpoint = function(descriptions) {
+  clock = "(\\d{1,2}:\\d{2}\\s*[ap]\\.?m\\.?)"
+  pattern = paste0("^\\s*", clock, "\\s+to\\s+", clock)
+  matches = regmatches(descriptions,
+                       regexec(pattern, descriptions, ignore.case = TRUE))
+
+  start_text = vapply(matches, function(m) {
+    if (length(m) == 3) m[2] else NA_character_
+  }, character(1))
+  end_text = vapply(matches, function(m) {
+    if (length(m) == 3) m[3] else NA_character_
+  }, character(1))
+
+  start_min = clock_to_minutes(start_text)
+  end_min = clock_to_minutes(end_text)
+
+  # A window that crosses midnight ends "before" it starts
+  wraps = !is.na(start_min) & !is.na(end_min) & end_min < start_min
+  end_min[wraps] = end_min[wraps] + 24 * 60
+
+  mid_min = ((start_min + end_min) / 2) %% (24 * 60)
+  hms(seconds = round(mid_min * 60))
+}
+
+time_range_midpoint(c("6:30 a.m. to 6:34 a.m.",
+                      "4:20 a.m. to 4:29 a.m.",
+                      "11:55 p.m. to 12:04 a.m.",
+                      "N/A (not a worker; worker who worked from home)"))
+```
+
+### Numeric and categorical variables
+
+Most numeric codes are just numbers, but some are special values listed in the dictionary: `0` means "N/A" for `JWMNP` and `GRPIP`, `3` means "N/A (... included in rent ...)" for `GASP`, and in 2023 `JWMNP` uses `888` for "Suppressed". Left alone, these would distort our means, so any code the dictionary describes as N/A or suppressed becomes `NA`. (Codes like `0` = "Under 1 year" for `AGEP` are real values and are kept.)
+
+Categorical variables become factors labeled from the dictionary, with levels ordered by code so ordinal variables like `SCHL` stay in order.
+
+```{r}
+# Convert an API time variable (JWAP/JWDP) from codes to hms midpoints
+parse_time_variable = function(codes, var_levels) {
+  lookup = dictionary_lookup(var_levels$values)
+  descriptions = unname(lookup[normalize_codes(codes)])
+  time_range_midpoint(descriptions)
+}
+
+# Convert an API numeric variable to numbers; N/A and suppressed codes become NA
+parse_numeric_variable = function(codes, var_levels) {
+  values = suppressWarnings(as.numeric(codes))
+  if (is.null(var_levels) || length(var_levels$values) == 0) {
+    return(values)
+  }
+
+  lookup = dictionary_lookup(var_levels$values)
+  is_special = grepl("^N/A|suppressed", lookup, ignore.case = TRUE)
+  special_codes = names(lookup)[is_special]
+
+  values[normalize_codes(codes) %in% special_codes] = NA
+  values
+}
+
+# Convert an API categorical variable into a factor labeled from the dictionary
+parse_categorical_variable = function(codes, var_levels) {
+  lookup = dictionary_lookup(var_levels$values)
+
+  # Order the levels by their numeric code
+  lookup = lookup[order(as.numeric(names(lookup)))]
+
+  factor(unname(lookup[normalize_codes(codes)]), levels = unname(lookup))
+}
+
+parse_categorical_variable(c("2", "1", "01"), variable_levels[["2024"]]$SEX)
+```
+
+### Geography
+
+The allowed states, divisions and regions come from our `.rds` file (`ST` in 2021/22, `STATE` in 2023/24, plus `REGION` and `DIVISION`), with Puerto Rico removed. The user can give a code (`"37"`), a name (`"North Carolina"`), a state abbreviation (`"NC"`), or `"all"`. This helper turns whatever they give into the codes the API expects, and gives an error listing the valid options if something doesn't match.
+
+```{r}
+# Dictionary values for a geography level, without Puerto Rico
+geography_levels = function(year_levels, geography) {
+  dictionary_name = switch(geography,
+    state = intersect(c("STATE", "ST"), names(year_levels))[1],
+    region = "REGION",
+    division = "DIVISION"
+  )
+  values = year_levels[[dictionary_name]]$values
+  values = values[normalize_codes(names(values)) != puerto_rico_codes[[geography]]]
+  list(values = values)
+}
+
+# Convert the user's subset value(s) into API codes ("*" for all)
+resolve_geography_codes = function(geo_value, geography, year_levels) {
+  allowed = geography_levels(year_levels, geography)$values
+  codes = normalize_codes(names(allowed))
+
+  if (length(geo_value) == 1 && tolower(geo_value) == "all") {
+    return("*")
+  }
+
+  labels = tolower(allowed)
+  short_names = tolower(trimws(sub("\\s*[/(].*$", "", allowed)))  # before / or (
+  abbreviations = tolower(trimws(sub("^.*/", "", allowed)))       # after /
+
+  resolved = vapply(geo_value, function(value) {
+    value_lower = tolower(trimws(as.character(value)))
+    hit = which(codes == normalize_codes(value_lower) |
+                  labels == value_lower |
+                  short_names == value_lower |
+                  (geography == "state" & abbreviations == value_lower))
+    if (length(hit) == 0) {
+      stop("'", value, "' is not a valid ", geography, " value. Options are:\n  ",
+           paste(sort(allowed), collapse = "\n  "))
+    }
+    codes[hit[1]]
+  }, character(1))
+
+  # The API expects two-digit state codes
+  if (geography == "state") {
+    resolved = sprintf("%02d", as.integer(resolved))
+  }
+  unname(resolved)
+}
+
+resolve_geography_codes(c("NC", "virginia", "13"), "state", variable_levels[["2024"]])
+resolve_geography_codes("South", "region", variable_levels[["2024"]])
+```
+
+### The query function
+
+Now we put it all together. The input checks live in their own function so `query_pums()` stays readable. After the API call, each column is converted with the helpers above, the geography column the API adds (e.g. `state`) is labeled, a `year` column is added, and the tibble gets the `census` class.
+
+```{r}
+# Build the PUMS API URL for one year
+build_pums_url = function(year, variables, geography, geo_codes) {
+  paste0("https://api.census.gov/data/", year, "/acs/acs1/pums",
+         "?get=", paste(variables, collapse = ","),
+         "&for=", geography, ":", paste(geo_codes, collapse = ","),
+         api_key_param())
+}
+
+# Check the user's inputs, stopping with an informative error if invalid
+check_query_inputs = function(year, numeric_vars, categorical_vars, geography) {
+  if (length(year) != 1 || !(year %in% valid_years)) {
+    stop("year must be a single value from: ", paste(valid_years, collapse = ", "))
+  }
+
+  bad_numeric = setdiff(numeric_vars, c(numeric_options, "PWGTP"))
+  if (length(bad_numeric) > 0) {
+    stop("Invalid numeric variable(s): ", paste(bad_numeric, collapse = ", "),
+         ". Options are: ", paste(numeric_options, collapse = ", "))
+  }
+  if (length(setdiff(numeric_vars, "PWGTP")) == 0) {
+    stop("At least one numeric variable other than PWGTP must be requested.")
+  }
+
+  bad_categorical = setdiff(categorical_vars, categorical_options)
+  if (length(bad_categorical) > 0) {
+    stop("Invalid categorical variable(s): ", paste(bad_categorical, collapse = ", "),
+         ". Options are: ", paste(categorical_options, collapse = ", "))
+  }
+  if (length(categorical_vars) == 0) {
+    stop("At least one categorical variable must be requested.")
+  }
+
+  if (length(geography) != 1 || !(tolower(geography) %in% geography_options)) {
+    stop("geography must be exactly one of: Region, Division, or State.")
+  }
+  invisible(TRUE)
+}
+
+# Query the PUMS API for one year and return a processed census tibble
+query_pums = function(year = 2024,
+                      numeric_vars = c("AGEP", "PWGTP"),
+                      categorical_vars = "SEX",
+                      geography = "State",
+                      geo_value = NULL) {
+  numeric_vars = toupper(numeric_vars)
+  categorical_vars = toupper(categorical_vars)
+  check_query_inputs(year, numeric_vars, categorical_vars, geography)
+
+  geography = tolower(geography)
+  numeric_vars = union("PWGTP", numeric_vars)
+  year_levels = load_year_levels(year)
+
+  if (is.null(geo_value)) {
+    geo_value = default_geo_value[[geography]]
+  }
+  geo_codes = resolve_geography_codes(geo_value, geography, year_levels)
+
+  url = build_pums_url(year, c(numeric_vars, categorical_vars),
+                       geography, geo_codes)
+  census_data = response_to_tibble(GET(url))
+
+  # Numeric and time variables
+  for (var in numeric_vars) {
+    if (var %in% time_vars) {
+      census_data[[var]] = parse_time_variable(census_data[[var]],
+                                               year_levels[[var]])
+    } else {
+      census_data[[var]] = parse_numeric_variable(census_data[[var]],
+                                                  year_levels[[var]])
+    }
+  }
+
+  # Categorical variables
+  for (var in categorical_vars) {
+    census_data[[var]] = parse_categorical_variable(census_data[[var]],
+                                                    year_levels[[var]])
+  }
+
+  # Label the geography column the API adds (e.g. "state")
+  census_data[[geography]] = parse_categorical_variable(
+    census_data[[geography]], geography_levels(year_levels, geography)
+  )
+
+  census_data$year = factor(year)
+
+  class(census_data) = c("census", class(census_data))
+  census_data
+}
+```
+
+### Testing the query function
+
+First, the defaults: 2024, age and weight, sex, for North Carolina.
+
+```{r}
+nc_default = query_pums()
+class(nc_default)
+nc_default
+```
+
+Next, a different year, more variables and a different geography: the New England division in 2022, with rent as a share of income (`GRPIP`), gas cost (`GASP`), arrival time at work (`JWAP`), household language (`HHL`) and school enrollment (`SCH`). `JWAP` comes back as a time, and N/A codes come back as `NA`.
+
+```{r}
+new_england = query_pums(year = 2022,
+                         numeric_vars = c("GRPIP", "GASP", "JWAP"),
+                         categorical_vars = c("HHL", "SCH"),
+                         geography = "Division",
+                         geo_value = "New England")
+new_england
+```
+
+Several states at once, named in different ways:
+
+```{r}
+carolinas = query_pums(year = 2023,
+                       numeric_vars = c("JWMNP", "JWDP"),
+                       categorical_vars = c("FER", "SCHL"),
+                       geo_value = c("NC", "South Carolina"))
+count(carolinas, state)
+```
+
+The `"all"` option returns every value of the chosen geography. All states or regions would be millions of rows, so here we just check that `"all"` becomes the `*` wildcard in the URL (with the key removed before printing):
+
+```{r}
+all_codes = resolve_geography_codes("all", "region", variable_levels[["2024"]])
+all_url = build_pums_url(2024, c("PWGTP", "AGEP", "SEX"), "region", all_codes)
+sub("&key=.*", "", all_url)  # don't print the API key on the website
+```
+
+Finally, the input checks. Each of these should fail with a helpful message.
+
+```{r}
+#| error: true
+query_pums(year = 2019)
+query_pums(numeric_vars = "PWGTP")
+query_pums(numeric_vars = c("AGEP", "INCOME"))
+query_pums(categorical_vars = character(0))
+query_pums(geography = "All")
+query_pums(geography = c("State", "Region"))
+query_pums(geo_value = "Puerto Rico")
+```
